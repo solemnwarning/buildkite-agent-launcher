@@ -1,0 +1,219 @@
+#!/usr/bin/perl
+# virt-launch - Helper script for launching libvirt VMs.
+# Copyright 2023 Daniel Collins <solemnwarning@solemnwarning.net>
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+#   Redistributions of source code must retain the above copyright notice, this
+#   list of conditions and the following disclaimer.
+#
+#   Redistributions in binary form must reproduce the above copyright notice,
+#   this list of conditions and the following disclaimer in the documentation
+#   and/or other materials provided with the distribution.
+#
+#   Neither the name of the copyright holder nor the names of its contributors
+#   may be used to endorse or promote products derived from this software
+#   without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+# LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+# CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use List::Util qw(max);
+use Number::Format qw(format_number);
+use Sys::Virt;
+
+use constant
+{
+	EX_USAGE => 64,
+	EX_NOHOST => 68,
+	EX_UNAVAILABLE => 69,
+	EX_TEMPFAIL => 75,
+};
+
+our $DEBUG_ENABLE = 0;
+
+sub main
+{
+	my $domain_match = 0;
+	my $mem_limit = undef;
+	
+	GetOptions(
+		"debug"        => \$DEBUG_ENABLE,
+		"name-match"   => \$domain_match,
+		"mem-limit=s"  => \$mem_limit,
+	) or exit_usage(EX_USAGE);
+	
+	exit_usage(EX_USAGE) if((scalar @ARGV) != 2);
+	
+	if(defined $mem_limit)
+	{
+		if($mem_limit =~ m/^(\d+)KiB$/)
+		{
+			$mem_limit = $1;
+		}
+		elsif($mem_limit =~ m/^(\d+)MiB$/)
+		{
+			$mem_limit = $1 * 1024;
+		}
+		elsif($mem_limit =~ m/^(\d+)GiB$/)
+		{
+			$mem_limit = $1 * 1024 * 1024;
+		}
+		elsif($mem_limit =~ m/^(\d+)%$/)
+		{
+			# Do nothing - percentages are handled later.
+		}
+		else{
+			print STDERR "Invalid --mem-limit option: $mem_limit\n";
+			exit_usage(EX_USAGE);
+		}
+	}
+	
+	my ($libvirt_uri, $domain) = @ARGV;
+	
+	my $virt = eval { Sys::Virt->new(uri => $libvirt_uri); };
+	if($@)
+	{
+		print STDERR "Unable to connect to libvirt: ".($@->message())."\n";
+		exit(EX_UNAVAILABLE);
+	}
+	
+	# Find any domains matching the name/regex...
+	my @matched_domains = grep {
+		$domain_match ?
+			$_->get_name() =~ m/$domain/
+			: ($_->get_name() eq $domain || $_->get_uuid_string() eq $domain) }
+		$virt->list_all_domains();
+	
+	if((scalar @matched_domains) > 1)
+	{
+		print STDERR "Found multiple domains matching expression $domain, aborting\n";
+		exit(EX_NOHOST);
+	}
+	elsif((scalar @matched_domains) == 0)
+	{
+		print STDERR "Could not find domain $domain, aborting\n";
+		exit(EX_NOHOST);
+	}
+	
+	my $virt_domain = $matched_domains[0];
+	
+	if($virt_domain->is_active())
+	{
+		print "Domain ", $virt_domain->get_name(), " is already active\n";
+		exit(0);
+	}
+	
+	if(defined $mem_limit)
+	{
+		print "--mem-limit is set, checking current host memory usage...\n" if($DEBUG_ENABLE);
+		
+		my ($used_mem_kib, $total_mem_kib) = get_host_mem_usage($virt);
+		my $used_mem_percent = ($used_mem_kib / $total_mem_kib) * 100;
+		
+		printf("Estimated host memory usage is %s KiB / %s KiB (%.02f%%)\n", format_number($used_mem_kib), format_number($total_mem_kib), $used_mem_percent) if($DEBUG_ENABLE);
+		
+		my $domain_mem_kib = $virt_domain->get_info()->{memory};
+		
+		print "Launching domain ", $virt_domain->get_name(), " requires ".format_number($domain_mem_kib)." KiB of memory\n" if($DEBUG_ENABLE);
+		
+		my $need_mem_kib = $used_mem_percent + $domain_mem_kib;
+		my $need_mem_percent = ($need_mem_kib / $total_mem_kib) * 100;
+		
+		my $need_mem_over_limit = $mem_limit =~ m/^(\d+)%$/
+			? $need_mem_percent > $1
+			: $need_mem_kib > $mem_limit;
+		
+		if($need_mem_over_limit)
+		{
+			print STDERR "Not enough free memory to launch domain ", $virt_domain->get_name(), "\n";
+			exit(EX_TEMPFAIL);
+		}
+	}
+	
+	$virt_domain->create();
+	
+	print "Domain ", $virt_domain->get_name(), " started\n";
+	
+	exit(0);
+}
+
+sub get_host_mem_usage
+{
+	my ($virt) = @_;
+	
+	# "How much memory is used?" isn't necessarily a straightforward answer
+	# in the context of a KVM libvirt host.
+	#
+	# Each VM has a current memory allocation, and a maximum memory
+	# allocation which allows for dynamically shrinking/growing a VMs
+	# memory pool using the "balloon" driver.
+	#
+	# Additionally, the current memory allocation for a VM isn't reserved
+	# by the host QEMU process, so you could spin up a bunch of VMs each
+	# with a memory allocation of many gigabytes, but the memory wouldn't
+	# actually be mapped by the host until the guest tries accessing it.
+	#
+	# So, we ask how much memory is used (free + cached) on the host and
+	# how much memory is currently allocated to all running guests and take
+	# the largest number - if the host is doing some memory-hungry work it
+	# will be reflected in the first number and if there are VMs with large
+	# memory allocations it will be reflected in the second number.
+	#
+	# This isn't a perfect solution - if both are true then we will
+	# under-estimate how much memory is allocated since we don't know how
+	# much of the VM reservations is reflected in the host memory stats.
+	
+	my $mem_stats = $virt->get_node_memory_stats();
+	
+	my $total_mem_kib = $mem_stats->{total};
+	my $used_mem_kib = $mem_stats->{total} - ($mem_stats->{free} + $mem_stats->{cached});
+	
+	print "Reported total memory: ".format_number($total_mem_kib)." KiB\n" if($DEBUG_ENABLE);
+	print "Reported used memory: ".format_number($used_mem_kib)." KiB\n" if($DEBUG_ENABLE);
+	
+	my @active_domains = grep { $_->is_active() } $virt->list_all_domains();
+	my $total_domain_mem_kib = 0;
+	
+	foreach my $domain(@active_domains)
+	{
+		my $domain_mem_kib = $domain->get_info()->{memory};
+		print "Memory allocated to domain ".$domain->get_name().": ".format_number($domain_mem_kib)." KiB\n" if($DEBUG_ENABLE);
+		
+		$total_domain_mem_kib += $domain_mem_kib;
+	}
+	
+	print "Total memory allocated to running VMs: ".format_number($total_domain_mem_kib)." KiB\n" if($DEBUG_ENABLE);
+	
+	return max($used_mem_kib, $total_domain_mem_kib), $total_mem_kib;
+}
+
+sub exit_usage
+{
+	my ($status) = @_;
+	
+	print STDERR "Usage: $0 [OPTIONS] <libvirt URI> <domain>\n";
+	print STDERR "  --debug                         - Enable debugging messages\n";
+	print STDERR "  --name-match                    - Specify <domain> as a regular expression\n";
+	print STDERR "  --mem-limit <nKiB|nMiB|nGiB|n%> - Specify total host memory limit\n";
+	
+	exit($status);
+}
+
+main() unless(caller);
+
+1;

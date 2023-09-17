@@ -1,0 +1,300 @@
+#!/usr/bin/perl
+# buildkite-agent-launcher - Start Buildkite agents using external commands.
+# Copyright 2023 Daniel Collins <solemnwarning@solemnwarning.net>
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+#   Redistributions of source code must retain the above copyright notice, this
+#   list of conditions and the following disclaimer.
+#
+#   Redistributions in binary form must reproduce the above copyright notice,
+#   this list of conditions and the following disclaimer in the documentation
+#   and/or other materials provided with the distribution.
+#
+#   Neither the name of the copyright holder nor the names of its contributors
+#   may be used to endorse or promote products derived from this software
+#   without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+# LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+# CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+
+use strict;
+use warnings;
+
+package App::BuildkiteAgentLauncher;
+
+use AnyEvent;
+use AnyEvent::HTTP;
+use JSON;
+use List::Compare;
+use YAML::Tiny;
+
+my $BUILDKITE_ORGANISATION;
+my $BUILDKITE_API_TOKEN;
+my $BUILDKITE_POLL_INTERVAL = 300;
+
+my $WEBHOOK_ADDRESS = "0.0.0.0";
+my $WEBHOOK_PORT;
+my $WEBHOOK_TOKEN;
+my $WEBHOOK_POLL_DELAY = 3;
+
+my @AGENTS;
+
+my $poll_timer;
+my $poll_running = 0;
+my $httpd;
+
+sub main
+{
+	die "Usage: $0 <config.yaml>\n" unless((scalar @ARGV) == 1);
+	
+	load_config($ARGV[0]);
+	
+	if(defined $WEBHOOK_PORT)
+	{
+		$httpd = App::BuildkiteAgentLauncher::WebhookServer->new(
+			$WEBHOOK_TOKEN,
+			\&poll_soon,
+			
+			host => $WEBHOOK_ADDRESS,
+			port => $WEBHOOK_PORT,
+		);
+	}
+	
+	my $exit_cv = AnyEvent->condvar();
+	
+	local $SIG{"TERM"} = sub
+	{
+		$exit_cv->send();
+	};
+	
+	# Do initial poll and schedule next one.
+	poll_now();
+	
+	# Wait for termination signal.
+	$exit_cv->recv();
+	
+	$poll_timer = undef;
+	$httpd      = undef;
+}
+
+sub load_config
+{
+	my ($filename) = @_;
+	
+	my $yaml = YAML::Tiny->read($filename);
+	my $doc  = $yaml->[0];
+	
+	$BUILDKITE_ORGANISATION  = $doc->{"buildkite organisation"};
+	$BUILDKITE_API_TOKEN     = $doc->{"buildkite api token"};
+	$BUILDKITE_POLL_INTERVAL = $doc->{"buildkite poll interval"} // $BUILDKITE_POLL_INTERVAL;
+	
+	die "No 'buildkite organisation' specified in $filename\n"
+		unless(defined($BUILDKITE_ORGANISATION));
+	
+	die "No 'buildkite api token' specified in $filename\n"
+		unless(defined($BUILDKITE_API_TOKEN));
+	
+	die "Invalid 'buildkite poll interval' specified in $filename\n"
+		unless($BUILDKITE_POLL_INTERVAL =~ m/^[1-9][0-9]*$/);
+	
+	$WEBHOOK_ADDRESS    = $doc->{"webhook listen address"} // $WEBHOOK_ADDRESS;
+	$WEBHOOK_PORT       = $doc->{"webhook listen port"}    // $WEBHOOK_PORT;
+	$WEBHOOK_TOKEN      = $doc->{"webhook token"}          // $WEBHOOK_TOKEN;
+	$WEBHOOK_POLL_DELAY = $doc->{"webhook poll delay"}     // $WEBHOOK_POLL_DELAY;
+	
+	die "Invalid 'webhook poll delay' specified in $filename\n"
+		unless($WEBHOOK_POLL_DELAY =~ m/^[1-9][0-9]*$/);
+	
+	die "Invalid 'webhook listen port' specified in $filename\n"
+		if(defined($WEBHOOK_PORT) && ($WEBHOOK_PORT !~ m/^[1-9][0-9]*$/ || $WEBHOOK_PORT >= 65536));
+	
+	die "No 'agents' specified in $filename\n"
+		unless(defined($doc->{agents}) && ref($doc->{agents}) eq "ARRAY");
+	
+	foreach my $agent(@{ $doc->{agents} })
+	{
+		die "Invalid agent definition in 'agents' in $filename\n"
+			unless(ref($agent) eq "HASH");
+		
+		die "No 'launch command' specified in agent definition in $filename\n"
+			unless(defined($agent->{"launch command"}) && ref($agent->{"launch command"}) eq "");
+		
+		push(@AGENTS, {
+			meta => [ split(m/,/, ($agent->{"meta-data"} // "queue=default")) ],
+			spawn => $agent->{"spawn"} // 1,
+			
+			launch => $agent->{"launch command"},
+		});
+	}
+}
+
+sub poll_now
+{
+	if($poll_running)
+	{
+		poll_soon();
+		return;
+	}
+	
+	$poll_timer   = AnyEvent->timer(after => $BUILDKITE_POLL_INTERVAL, cb => \&poll_now);
+	$poll_running = 1;
+	
+	http_request(
+		"GET", "https://api.buildkite.com/v2/organizations/${BUILDKITE_ORGANISATION}/builds?state[]=scheduled&state[]=running&state[]=failing",
+		headers => { "Authorization" => "Bearer $BUILDKITE_API_TOKEN" },
+		sub
+		{
+			my ($body, $hdr) = @_;
+			
+			if($hdr->{Status} == 200)
+			{
+				my @builds;
+				eval { @builds = @{ decode_json($body) }; };
+				
+				if($@)
+				{
+					print STDERR "Error decoding JSON response from Buildkite API: $@\n";
+				}
+				else{
+					poll_finish(@builds);
+				}
+			}
+			else{
+				print STDERR "Got HTTP code ".$hdr->{Status}." from Buildkite API\n${body}\n";
+			}
+			
+			$poll_running = 0;
+		});
+}
+
+sub poll_finish
+{
+	my @builds = @_;
+	
+	# Extract all running/scheduled jobs ("steps") from the list of builds, since
+	# they're what actually get allocated to agents.
+	my @jobs = grep { $_->{type} eq "script" && ($_->{state} eq "scheduled" || $_->{state} eq "running") }
+		map { @{ $_->{jobs} } } @builds;
+	
+	foreach my $agent(@AGENTS)
+	{
+		$agent->{failed} = 0;
+		$agent->{jobs_selected} = 0;
+	}
+	
+	JOB: foreach my $job(@jobs)
+	{
+		foreach my $agent(@AGENTS)
+		{
+			if(@{ $job->{agent_query_rules} } && List::Compare->new($job->{agent_query_rules}, $agent->{meta})->is_LsubsetR() && $agent->{jobs_selected} < $agent->{spawn} && !$agent->{failed})
+			{
+				# This job provides everything in the job's agent_query_rules.
+				
+				if($agent->{jobs_selected} > 0)
+				{
+					# We already launched this agent on this poll, just mark
+					# the agent as being assigned to it.
+					
+					($agent->{jobs_selected})++;
+					next JOB;
+				}
+				
+				print "Running command ", $agent->{launch}, "\n";
+				my $status = system($agent->{launch});
+				
+				if($status == 0)
+				{
+					# Agent launched successfully.
+					
+					($agent->{jobs_selected})++;
+					next JOB;
+				}
+				else{
+					$agent->{failed} = 1;
+					print STDERR "Command returned status $status\n";
+				}
+			}
+		}
+	}
+	
+	$poll_running = 0;
+}
+
+sub poll_soon
+{
+	$poll_timer = AnyEvent->timer(after => $WEBHOOK_POLL_DELAY, cb => \&poll_now);
+}
+
+package App::BuildkiteAgentLauncher::WebhookServer;
+
+use AnyEvent::HTTPD;
+
+sub new
+{
+	my ($class, $token, $callback, %httpd_options) = @_;
+	
+	my $httpd = AnyEvent::HTTPD->new(%httpd_options);
+	
+	$httpd->reg_cb ("/" => sub
+	{
+		my ($httpd, $req) = @_;
+		
+		# Don't fall through to default handler.
+		$httpd->stop_request;
+		
+		if(defined $token)
+		{
+			my $req_token = $req->headers()->{"x-buildkite-token"} // "";
+			
+			if($req_token ne $token)
+			{
+				$req->respond([
+					403, "Forbidden",
+					{ "Content-Type" => "text/plain" },
+					"Forbidden\n"]);
+				
+				return;
+			}
+		}
+		
+		$callback->();
+		
+		$req->respond([
+			200, "OK",
+			{ "Content-Type" => "text/plain" },
+			"OK\n"]);
+	});
+	
+	$httpd->reg_cb ("" => sub
+	{
+		my ($httpd, $req) = @_;
+		
+		$req->respond([
+			404, "Not Found",
+			{ "Content-Type" => "text/plain" },
+			"Not Found\n"]);
+	});
+	
+	return bless({ httpd => $httpd }, $class);
+}
+
+sub port
+{
+	my ($self) = @_;
+	return $self->{httpd}->port();
+}
+
+App::BuildkiteAgentLauncher->main() unless(caller);
+
+1;

@@ -1,0 +1,15 @@
+# buildkite organisation: ...
+# buildkite api token: ...
+
+# webhook listen port: 1234
+# webhook token: abcd
+
+# buildkite poll interval: 300
+
+agents:
+  - meta-data: "queue=foo"
+    spawn: 2
+    launch command: "systemctl start buildkite-agent"
+
+  - meta-data: "queue=bar"
+    launch command: "ssh otherbox systemctl start buildkite-agent"
