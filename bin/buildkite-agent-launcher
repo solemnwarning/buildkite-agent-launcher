@@ -1,6 +1,6 @@
 #!/usr/bin/perl
 # buildkite-agent-launcher - Start Buildkite agents using external commands.
-# Copyright 2023 Daniel Collins <solemnwarning@solemnwarning.net>
+# Copyright 2023-2024 Daniel Collins <solemnwarning@solemnwarning.net>
 #
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions are met:
@@ -37,6 +37,7 @@ use AnyEvent;
 use AnyEvent::HTTP;
 use JSON;
 use List::Compare;
+use POSIX qw(WIFEXITED WEXITSTATUS WIFSIGNALED WTERMSIG);
 use YAML::Tiny;
 
 my $BUILDKITE_ORGANISATION;
@@ -199,7 +200,7 @@ sub poll_finish
 		{
 			if(@{ $job->{agent_query_rules} } && List::Compare->new($job->{agent_query_rules}, $agent->{meta})->is_LsubsetR() && $agent->{jobs_selected} < $agent->{spawn} && !$agent->{failed})
 			{
-				# This job provides everything in the job's agent_query_rules.
+				# This agent provides everything in the job's agent_query_rules.
 				
 				if($agent->{jobs_selected} > 0)
 				{
@@ -213,16 +214,32 @@ sub poll_finish
 				print "Running command ", $agent->{launch}, "\n";
 				my $status = system($agent->{launch});
 				
-				if($status == 0)
+				if(WIFEXITED($status) && WEXITSTATUS($status) == 0)
 				{
 					# Agent launched successfully.
 					
 					($agent->{jobs_selected})++;
 					next JOB;
 				}
-				else{
+				elsif(WIFEXITED($status) && WEXITSTATUS($status) == 75) # EX_TEMPFAIL
+				{
+					# Temporary failure.
+					# Count this as a success so we don't kick off unwanted agents.
+					
+					print STDERR "Command returned status 75 (temporary failure)\n";
+					
+					($agent->{jobs_selected})++;
+					next JOB;
+				}
+				elsif(WIFEXITED($status))
+				{
+					print STDERR "Command returned status ", WEXITSTATUS($status), "\n";
 					$agent->{failed} = 1;
-					print STDERR "Command returned status $status\n";
+				}
+				elsif(WIFSIGNALED($status))
+				{
+					print STDERR "Command killed by signal ", WTERMSIG($status), "\n";
+					$agent->{failed} = 1;
 				}
 			}
 		}
