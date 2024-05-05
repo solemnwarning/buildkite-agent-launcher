@@ -131,7 +131,7 @@ sub main
 		
 		print "Launching domain ", $virt_domain->get_name(), " requires ".format_number($domain_mem_kib)." KiB of memory\n" if($DEBUG_ENABLE);
 		
-		my $need_mem_kib = $used_mem_percent + $domain_mem_kib;
+		my $need_mem_kib = $used_mem_kib + $domain_mem_kib;
 		my $need_mem_percent = ($need_mem_kib / $total_mem_kib) * 100;
 		
 		my $need_mem_over_limit = $mem_limit =~ m/^(\d+)%$/
