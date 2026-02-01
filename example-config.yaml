@@ -1,0 +1,25 @@
+# Buildkite organisation and API token used to check running jobs.
+# The token must have the `read_builds` scope.
+buildkite organisation: example-inc
+buildkite api token: bkua_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+
+# Optional HTTP listen port and token for webhook triggering.
+# webhook listen port: 1234
+# webhook token: abcd
+
+# Query Buildkite for scheduled/running jobs every 30 seconds.
+buildkite poll interval: 30
+
+agents:
+  # Start the buildkite-agent service when a job is scheduled for the default
+  # queue if it isn't already running.
+  - tags: queue=default
+    check command: systemctl is-active buildkite-agent.service || exit 1
+    launch command: systemctl start buildkite-agent.service
+
+  # Send a power on command to bob.example.com when a job is scheduled for the
+  # 'bob' queue. This agent can service 4 jobs at once.
+  - tags: queue=bob
+    check command: ping -c1 -w5 bob.example.com > /dev/null 2>&1
+    launch command: powerwake bob.example.com
+    spawn: 4
