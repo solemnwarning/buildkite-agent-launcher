@@ -1,0 +1,10 @@
+[Unit]
+Description=buildkite-agent-launcher
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/buildkite-agent-launcher /etc/buildkite-agent-launcher/config.yaml
+
+[Install]
+WantedBy=multi-user.target
