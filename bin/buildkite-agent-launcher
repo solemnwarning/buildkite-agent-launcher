@@ -36,8 +36,6 @@ package App::BuildkiteAgentLauncher;
 use AnyEvent;
 use AnyEvent::HTTP;
 use JSON;
-use List::Compare;
-use POSIX qw(WIFEXITED WEXITSTATUS WIFSIGNALED WTERMSIG);
 use YAML::Tiny;
 
 my $BUILDKITE_ORGANISATION;
@@ -128,46 +126,82 @@ sub load_config
 		die "Invalid agent definition in 'agents' in $filename\n"
 			unless(ref($agent) eq "HASH");
 		
+		my %options = ();
+		
+		if(defined $agent->{"meta-data"})
+		{
+			# Buildkite 2.x called tags "agent meta-data"
+			
+			warn "Deprecated 'meta-data' parameter specified in $filename - use 'tags' instead\n";
+			
+			if(defined $agent->{"tags"})
+			{
+				die "'tags' and 'meta-data' cannot be specified together on the same agent in $filename\n";
+			}
+			
+			$options{tags} = [ split(m/,/, $agent->{"meta-data"}) ];
+		}
+		elsif(defined $agent->{"tags"})
+		{
+			$options{tags} = [ split(m/,/, $agent->{"tags"}) ];
+		}
+		else{
+			$options{tags} = [ "queue=default" ];
+		}
+		
+		if(defined $agent->{"count command"})
+		{
+			if(defined $agent->{"check command"})
+			{
+				die "'check command' and 'count command' cannot be specified together on the same agent in $filename\n";
+			}
+			
+			if(defined $agent->{"spawn"})
+			{
+				die "'spawn' and 'count command' cannot be specified together on the same agent in $filename\n";
+			}
+			
+			$options{count_command} = $agent->{"count command"};
+			
+			if(defined $agent->{"max instances"})
+			{
+				$options{max_instances} = $agent->{"max instances"};
+			}
+			
+			$options{spawn_per_instance} = $agent->{"spawn per instance"} // 1;
+		}
+		elsif(defined $agent->{"check command"})
+		{
+			if(defined $agent->{"max instances"})
+			{
+				die "'check command' and 'max instances' cannot be specified together on the same agent in $filename\n";
+			}
+			
+			if(defined $agent->{"spawn per instance"})
+			{
+				die "'check command' and 'spawn per instance' cannot be specified together on the same agent in $filename\n";
+			}
+			
+			$options{check_command} = $agent->{"check command"};
+			
+			$options{spawn} = $agent->{"spawn"} // 1;
+		}
+		else{
+			die "No 'count command' or 'check command' specified in agent definition in $filename\n";
+		}
+		
 		die "No 'launch command' specified in agent definition in $filename\n"
 			unless(defined($agent->{"launch command"}) && ref($agent->{"launch command"}) eq "");
 		
-		my %agent_out = (
-			meta => [ split(m/,/, ($agent->{"meta-data"} // "queue=default")) ],
-			launch => $agent->{"launch command"},
-		);
+		$options{launch_command} = $agent->{"launch command"};
 		
-		die "'spawn' and 'spawn per instance' cannot be used in the same agent definition in $filename\n"
-			if(defined($agent->{"spawn"}) && defined($agent->{"spawn per instance"}));
-		
-		if(defined $agent->{"instance count command"})
+		if(defined $options{check_command})
 		{
-			die "'spawn' and 'instance count command' cannot be used in the same agent definition in $filename\n"
-				if(defined $agent->{"spawn"});
-			
-			$agent_out{count} = $agent->{"instance count command"};
-			$agent_out{spawn_per_instance} = $agent->{"spawn per instance"} // 1;
-			$agent_out{max_instances} = $agent->{"max instances"};
-			
-			die "Invalid 'spawn per instance' specified in $filename\n"
-				if($agent_out{spawn_per_instance} !~ m/^[1-9][0-9]*$/);
-			
-			die "Invalid 'max instances' specified in $filename\n"
-				if(defined($agent_out{max_instances}) && $agent_out{max_instances} !~ m/^[1-9][0-9]*$/);
+			push(@AGENTS, App::BuildkiteAgentLauncher::SingleAgent->new(%options));
 		}
 		else{
-			die "'instance count command' must be specified when 'spawn per instance' is specified in $filename\n"
-				if(defined $agent->{"spawn per instance"});
-			
-			die "'instance count command' must be specified when 'max instances' is specified in $filename\n"
-				if(defined $agent->{"max instances"});
-			
-			$agent_out{spawn} = $agent->{"spawn"} // 1;
-			
-			die "Invalid 'spawn' specified in $filename\n"
-				if($agent_out{spawn} !~ m/^[1-9][0-9]*$/);
+			push(@AGENTS, App::BuildkiteAgentLauncher::MultiAgent->new(%options));
 		}
-		
-		push(@AGENTS, \%agent_out);
 	}
 }
 
@@ -219,139 +253,37 @@ sub poll_finish
 	my @jobs = grep { $_->{type} eq "script" && ($_->{state} eq "scheduled" || $_->{state} eq "running") }
 		map { @{ $_->{jobs} } } @builds;
 	
+	# Clear any counters from previous poll - we will re-learn the number of currently running
+	# instances and assign jobs from scratch.
 	foreach my $agent(@AGENTS)
 	{
-		$agent->{failed} = 0;
-		$agent->{jobs_selected} = 0;
-		
-		if(defined $agent->{count})
-		{
-			$agent->{instances} = undef;
-			$agent->{spawn} = 0;
-		}
+		$agent->reset();
 	}
 	
 	JOB: foreach my $job(@jobs)
 	{
-		AGENT: foreach my $agent(@AGENTS)
+		# First, we check if any agents are already running that satisfy the job.
+		
+		foreach my $agent(@AGENTS)
 		{
-			if(@{ $job->{agent_query_rules} } && List::Compare->new($job->{agent_query_rules}, $agent->{meta})->is_LsubsetR() && !$agent->{failed})
+			if($agent->satisfies_query_rules(@{ $job->{agent_query_rules} })
+				&& !$agent->failed()
+				&& $agent->assign_job())
 			{
-				# This agent provides everything in the job's agent_query_rules.
-				
-				my $try_launch = sub
-				{
-					print "Running command ", $agent->{launch}, "\n";
-					my $status = system($agent->{launch});
-					
-					if(WIFEXITED($status) && WEXITSTATUS($status) == 0)
-					{
-						# Agent launched successfully.
-						return 1;
-					}
-					elsif(WIFEXITED($status) && WEXITSTATUS($status) == 75) # EX_TEMPFAIL
-					{
-						# Temporary failure.
-						# Count this as a success so we don't kick off unwanted agents.
-						
-						print STDERR "Command returned status 75 (temporary failure)\n";
-						return 1;
-					}
-					elsif(WIFEXITED($status))
-					{
-						print STDERR "Command returned status ", WEXITSTATUS($status), "\n";
-						return 0;
-					}
-					elsif(WIFSIGNALED($status))
-					{
-						print STDERR "Command killed by signal ", WTERMSIG($status), "\n";
-						return 0;
-					}
-				};
-				
-				if(defined($agent->{count}))
-				{
-					# This is a dynamically scalable agent.
-					
-					unless(defined $agent->{instances})
-					{
-						# Check how many instances are running.
-						
-						print "Running command ", $agent->{count}, "\n";
-						
-						my $output = `$agent->{count}`;
-						my $status = $?;
-						
-						if(WIFEXITED($status) && WEXITSTATUS($status) != 0)
-						{
-							print STDERR "Command returned status ", WEXITSTATUS($status), "\n";
-							$agent->{failed} = 1;
-							
-							next AGENT;
-						}
-						elsif(WIFSIGNALED($status))
-						{
-							print STDERR "Command killed by signal ", WTERMSIG($status), "\n";
-							$agent->{failed} = 1;
-							
-							next AGENT;
-						}
-						
-						if($output =~ m/^([0-9]+)\r?\n?/s)
-						{
-							$agent->{instances} = $1;
-							$agent->{spawn} = $agent->{instances} * $agent->{spawn_per_instance};
-							
-							print "Instance count: ", $agent->{instances}, ", spawn count: ", $agent->{spawn}, "\n";
-						}
-						else{
-							print STDERR "Unexpected output from command (expected an integer):\n";
-							print STDERR "$output\n";
-							
-							next AGENT;
-						}
-					}
-					
-					if($agent->{jobs_selected} >= $agent->{spawn}
-						&& (!defined($agent->{max_instances}) || $agent->{instances} < $agent->{max_instances}))
-					{
-						# This agent specification has already reached capacity, but it can be scaled up.
-						
-						if($try_launch->())
-						{
-							$agent->{instances} += 1;
-							$agent->{spawn} += $agent->{spawn_per_instance};
-							
-							$agent->{jobs_selected} += 1;
-							
-							next JOB;
-						}
-						else{
-							$agent->{failed} = 1;
-						}
-					}
-				}
-				else{
-					# This is a single-instance agent.
-					
-					if($agent->{jobs_selected} > 0)
-					{
-						# We already launched this agent on this poll, just mark
-						# the agent as being assigned to it.
-						
-						($agent->{jobs_selected})++;
-						next JOB;
-					}
-					
-					if($try_launch->())
-					{
-						$agent->{jobs_selected} += 1;
-						next JOB;
-					}
-					else{
-						$agent->{failed} = 1;
-					}
-				}
+				next JOB;
+			}
+		}
+		
+		# Next we try to find an agent we can start/scale to satisfy the job.
+		
+		foreach my $agent(@AGENTS)
+		{
+			if($agent->satisfies_query_rules(@{ $job->{agent_query_rules} })
+				&& !$agent->failed()
+				&& $agent->increase_spawn()
+				&& $agent->assign_job())
+			{
+				next JOB;
 			}
 		}
 	}
@@ -422,6 +354,296 @@ sub port
 	my ($self) = @_;
 	return $self->{httpd}->port();
 }
+
+package App::BuildkiteAgentLauncher::Agent;
+
+use Carp qw(confess);
+use List::Compare;
+use POSIX qw(WIFEXITED WEXITSTATUS WIFSIGNALED WTERMSIG);
+
+sub new
+{
+	my ($class, %options) = @_;
+	
+	my $self = bless({
+		tags           => ($options{tags}           // confess("Required option 'tags' missing\n")),
+		launch_command => ($options{launch_command} // confess("Required option 'launch_command' missing\n")),
+		
+		failed       => 0,
+		current_jobs => 0,
+	}, $class);
+	
+	return $self;
+}
+
+sub tags
+{
+	my ($self) = @_;
+	return @{ $self->{tags} };
+}
+
+sub satisfies_query_rules
+{
+	my ($self, @query_rules) = @_;
+	
+	return List::Compare->new(\@query_rules, $self->{tags})->is_LsubsetR();
+}
+
+sub failed
+{
+	my ($self) = @_;
+	return $self->{failed};
+}
+
+sub reset
+{
+	my ($self) = @_;
+	
+	$self->{failed}       = 0;
+	$self->{current_jobs} = 0;
+	
+	return;
+}
+
+sub _launch
+{
+	my ($self) = @_;
+	
+	print "Running command ", $self->{launch_command}, "\n";
+	my $status = system($self->{launch_command});
+	
+	if(WIFEXITED($status) && WEXITSTATUS($status) == 0)
+	{
+		# Agent launched successfully.
+		return 1;
+	}
+	elsif(WIFEXITED($status) && WEXITSTATUS($status) == 75) # EX_TEMPFAIL
+	{
+		# Temporary failure.
+		# Count this as a success so we don't kick off unwanted agents.
+		
+		print STDERR "Command returned status 75 (temporary failure)\n";
+		
+		return 1;
+	}
+	elsif(WIFEXITED($status))
+	{
+		print STDERR "Command returned status ", WEXITSTATUS($status), "\n";
+		$self->{failed} = 1;
+		
+		return 0;
+	}
+	elsif(WIFSIGNALED($status))
+	{
+		print STDERR "Command killed by signal ", WTERMSIG($status), "\n";
+		$self->{failed} = 1;
+		
+		return 0;
+	}
+	
+	# Unreachable(?)
+	return 0;
+}
+
+sub assign_job
+{
+	my ($self) = @_;
+	
+	if($self->{current_jobs} < $self->current_spawn())
+	{
+		$self->{current_jobs} += 1;
+		return 1;
+	}
+	else{
+		return 0;
+	}
+}
+
+package App::BuildkiteAgentLauncher::SingleAgent;
+use base qw(App::BuildkiteAgentLauncher::Agent);
+
+use Carp qw(confess);
+use POSIX qw(WIFEXITED WEXITSTATUS WIFSIGNALED WTERMSIG);
+
+sub new
+{
+	my ($class, %options) = @_;
+	
+	my $self = $class->SUPER::new(%options);
+	
+	$self->{check_command} = $options{check_command} // confess("Required option 'check_command' missing\n");
+	$self->{spawn}         = $options{spawn}         // confess("Required option 'spawn' missing\n");
+	
+	$self->{running} = undef;
+	
+	return $self;
+}
+
+sub reset
+{
+	my ($self) = @_;
+	
+	$self->{running} = undef;
+	
+	$self->SUPER::reset();
+	
+	return;
+}
+
+sub current_spawn
+{
+	my ($self) = @_;
+	
+	unless(defined $self->{running})
+	{
+		print "Running command ", $self->{check_command}, "\n";
+		
+		my $status = system($self->{check_command});
+		
+		if(WIFEXITED($status))
+		{
+			my $es = WEXITSTATUS($status);
+			
+			if($es == 0)
+			{
+				print STDERR "Command returned status $es (running)\n";
+				$self->{running} = 1;
+			}
+			elsif($es == 1)
+			{
+				print STDERR "Command returned status $es (not running)\n";
+				$self->{running} = 0;
+			}
+			else{
+				print STDERR "Command returned status $es (error)\n";
+				$self->{failed} = 1;
+				$self->{running} = 0;
+			}
+		}
+		elsif(WIFSIGNALED($status))
+		{
+			print STDERR "Command killed by signal ", WTERMSIG($status), "\n";
+			$self->{failed} = 1;
+			$self->{running} = 0;
+		}
+	}
+	
+	return $self->{running} ? $self->{spawn} : 0;
+}
+
+sub increase_spawn
+{
+	my ($self) = @_;
+	
+	if($self->{running})
+	{
+		return 0;
+	}
+	
+	$self->{running} = $self->_launch();
+	return $self->{running};
+}
+
+package App::BuildkiteAgentLauncher::MultiAgent;
+use base qw(App::BuildkiteAgentLauncher::Agent);
+
+use Carp qw(confess);
+use POSIX qw(WIFEXITED WEXITSTATUS WIFSIGNALED WTERMSIG);
+
+sub new
+{
+	my ($class, %options) = @_;
+	
+	my $self = $class->SUPER::new(%options);
+	
+	$self->{count_command}      = $options{count_command}      // confess("Required option 'count_command' missing\n");
+	$self->{spawn_per_instance} = $options{spawn_per_instance} // confess("Required option 'spawn_per_instance' missing\n");
+	$self->{max_instances}      = $options{max_instances};
+	
+	$self->{current_instances} = undef;
+	
+	return $self;
+}
+
+sub reset
+{
+	my ($self) = @_;
+	
+	$self->{current_instances} = undef;
+	
+	$self->SUPER::reset();
+	
+	return;
+}
+
+sub current_spawn
+{
+	my ($self) = @_;
+	
+	unless(defined $self->{current_instances})
+	{
+		print "Running command ", $self->{count_command}, "\n";
+		
+		my $output = `$self->{count_command}`;
+		my $status = $?;
+		
+		if(WIFEXITED($status) && WEXITSTATUS($status) != 0)
+		{
+			print STDERR "Command returned status ", WEXITSTATUS($status), "\n";
+			$self->{failed} = 1;
+			
+			return 0;
+		}
+		elsif(WIFSIGNALED($status))
+		{
+			print STDERR "Command killed by signal ", WTERMSIG($status), "\n";
+			$self->{failed} = 1;
+			
+			return 0;
+		}
+		
+		if($output =~ m/^([0-9]+)\r?\n?/s)
+		{
+			$self->{current_instances} = $1;
+			
+			print "Instance count: ", $self->{current_instances}, "\n";
+		}
+		else{
+			print STDERR "Unexpected output from command (expected an integer):\n";
+			
+			foreach my $line(split(m/\r?\n/, $output))
+			{
+				chomp($line);
+				print "> $line\n";
+			}
+			
+			return 0;
+		}
+	}
+	
+	return $self->{current_instances} * $self->{spawn_per_instance};
+}
+
+sub increase_spawn
+{
+	my ($self) = @_;
+	
+	if(defined($self->{max_instances}) && $self->{current_instances} >= $self->{max_instances})
+	{
+		return 0;
+	}
+	
+	if($self->_launch())
+	{
+		$self->{current_instances} += 1;
+		return 1;
+	}
+	else{
+		return 0;
+	}
+}
+
+package main;
 
 App::BuildkiteAgentLauncher->main() unless(caller);
 
