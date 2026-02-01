@@ -7,9 +7,61 @@
 # buildkite poll interval: 300
 
 agents:
+  # These are static agent definitions which can each service a fixed number
+  # of jobs.
+  #
+  # The "launch command" must be idempotent - that is, if it is run multiple
+  # times, it will only start the agent once, this is because
+  # buildkite-agent-launcher will continue to run it periodically so long as
+  # there is a job that demands it.
+  #
+  # If the launch command returns status 0 (success), it is assumed the agent
+  # was either started successfully or was already running and jobs can be
+  # assigned to it.
+  #
+  # If the launch command returns status 75 EX_TEMPFAIL, it is assumed the
+  # agent is in the process of being started, this acts the same as returning
+  # success in buildkite-agent-launcher.
+  #
+  # If the launch command returns any other status or is terminated by a
+  # signal, it is assumed the agent failed to start and we will continue down
+  # the list of agents until one successfully starts when allocating jobs.
+  #
+  # The "spawn" parameter is optional and defaults to one.
+
   - meta-data: "queue=foo"
     spawn: 2
     launch command: "systemctl start buildkite-agent"
 
   - meta-data: "queue=bar"
     launch command: "ssh otherbox systemctl start buildkite-agent"
+
+  # This is a dynamically-scaled agent definition which will start multiple VM
+  # instances as necessary to handle more jobs.
+  #
+  # The "check command" is executed to check how many instances of this agent
+  # are running when a job that matches the agent is queued, it must output an
+  # integer to standard output and exit successfully.
+  #
+  # Unlike static agents, the "launch command" will only be executed when
+  # additional agents are required and does not need to be idempotent.
+  #
+  # Up to "max instances" will be started at once. If "max instances" is not
+  # specified there is no limit on the number that may be started.
+  #
+  # The "spawn per instance" parameter is optional and defaults to one.
+
+  - meta-data: "queue=debian"
+
+    # Each VM instance can service two jobs.
+    spawn per instance: 2
+
+    # Limit to four concurrent VMs - if this isn't specified we will attempt to
+    # start as many instances as necessary to service all queued jobs.
+    max instances: 4
+
+    # Count the number of running VMs.
+    check command: "virsh list --state-running --name | grep -c '^build-agent-debian-'"
+
+    # Start another templated build agent VM.
+    launch command: "virt-from-template --mem-limit=90% create /srv/vm-templates/build-agent-debian/build-agent-debian.xml"

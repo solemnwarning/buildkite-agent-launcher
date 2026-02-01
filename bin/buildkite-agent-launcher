@@ -1,6 +1,6 @@
 #!/usr/bin/perl
 # buildkite-agent-launcher - Start Buildkite agents using external commands.
-# Copyright 2023-2024 Daniel Collins <solemnwarning@solemnwarning.net>
+# Copyright 2023-2026 Daniel Collins <solemnwarning@solemnwarning.net>
 #
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions are met:
@@ -131,12 +131,43 @@ sub load_config
 		die "No 'launch command' specified in agent definition in $filename\n"
 			unless(defined($agent->{"launch command"}) && ref($agent->{"launch command"}) eq "");
 		
-		push(@AGENTS, {
+		my %agent_out = (
 			meta => [ split(m/,/, ($agent->{"meta-data"} // "queue=default")) ],
-			spawn => $agent->{"spawn"} // 1,
-			
 			launch => $agent->{"launch command"},
-		});
+		);
+		
+		die "'spawn' and 'spawn per instance' cannot be used in the same agent definition in $filename\n"
+			if(defined($agent->{"spawn"}) && defined($agent->{"spawn per instance"}));
+		
+		if(defined $agent->{"instance count command"})
+		{
+			die "'spawn' and 'instance count command' cannot be used in the same agent definition in $filename\n"
+				if(defined $agent->{"spawn"});
+			
+			$agent_out{count} = $agent->{"instance count command"};
+			$agent_out{spawn_per_instance} = $agent->{"spawn per instance"} // 1;
+			$agent_out{max_instances} = $agent->{"max instances"};
+			
+			die "Invalid 'spawn per instance' specified in $filename\n"
+				if($agent_out{spawn_per_instance} !~ m/^[1-9][0-9]*$/);
+			
+			die "Invalid 'max instances' specified in $filename\n"
+				if(defined($agent_out{max_instances}) && $agent_out{max_instances} !~ m/^[1-9][0-9]*$/);
+		}
+		else{
+			die "'instance count command' must be specified when 'spawn per instance' is specified in $filename\n"
+				if(defined $agent->{"spawn per instance"});
+			
+			die "'instance count command' must be specified when 'max instances' is specified in $filename\n"
+				if(defined $agent->{"max instances"});
+			
+			$agent_out{spawn} = $agent->{"spawn"} // 1;
+			
+			die "Invalid 'spawn' specified in $filename\n"
+				if($agent_out{spawn} !~ m/^[1-9][0-9]*$/);
+		}
+		
+		push(@AGENTS, \%agent_out);
 	}
 }
 
@@ -192,54 +223,134 @@ sub poll_finish
 	{
 		$agent->{failed} = 0;
 		$agent->{jobs_selected} = 0;
+		
+		if(defined $agent->{count})
+		{
+			$agent->{instances} = undef;
+			$agent->{spawn} = 0;
+		}
 	}
 	
 	JOB: foreach my $job(@jobs)
 	{
-		foreach my $agent(@AGENTS)
+		AGENT: foreach my $agent(@AGENTS)
 		{
-			if(@{ $job->{agent_query_rules} } && List::Compare->new($job->{agent_query_rules}, $agent->{meta})->is_LsubsetR() && $agent->{jobs_selected} < $agent->{spawn} && !$agent->{failed})
+			if(@{ $job->{agent_query_rules} } && List::Compare->new($job->{agent_query_rules}, $agent->{meta})->is_LsubsetR() && !$agent->{failed})
 			{
 				# This agent provides everything in the job's agent_query_rules.
 				
-				if($agent->{jobs_selected} > 0)
+				my $try_launch = sub
 				{
-					# We already launched this agent on this poll, just mark
-					# the agent as being assigned to it.
+					print "Running command ", $agent->{launch}, "\n";
+					my $status = system($agent->{launch});
 					
-					($agent->{jobs_selected})++;
-					next JOB;
-				}
+					if(WIFEXITED($status) && WEXITSTATUS($status) == 0)
+					{
+						# Agent launched successfully.
+						return 1;
+					}
+					elsif(WIFEXITED($status) && WEXITSTATUS($status) == 75) # EX_TEMPFAIL
+					{
+						# Temporary failure.
+						# Count this as a success so we don't kick off unwanted agents.
+						
+						print STDERR "Command returned status 75 (temporary failure)\n";
+						return 1;
+					}
+					elsif(WIFEXITED($status))
+					{
+						print STDERR "Command returned status ", WEXITSTATUS($status), "\n";
+						return 0;
+					}
+					elsif(WIFSIGNALED($status))
+					{
+						print STDERR "Command killed by signal ", WTERMSIG($status), "\n";
+						return 0;
+					}
+				};
 				
-				print "Running command ", $agent->{launch}, "\n";
-				my $status = system($agent->{launch});
-				
-				if(WIFEXITED($status) && WEXITSTATUS($status) == 0)
+				if(defined($agent->{count}))
 				{
-					# Agent launched successfully.
+					# This is a dynamically scalable agent.
 					
-					($agent->{jobs_selected})++;
-					next JOB;
-				}
-				elsif(WIFEXITED($status) && WEXITSTATUS($status) == 75) # EX_TEMPFAIL
-				{
-					# Temporary failure.
-					# Count this as a success so we don't kick off unwanted agents.
+					unless(defined $agent->{instances})
+					{
+						# Check how many instances are running.
+						
+						print "Running command ", $agent->{count}, "\n";
+						
+						my $output = `$agent->{count}`;
+						my $status = $?;
+						
+						if(WIFEXITED($status) && WEXITSTATUS($status) != 0)
+						{
+							print STDERR "Command returned status ", WEXITSTATUS($status), "\n";
+							$agent->{failed} = 1;
+							
+							next AGENT;
+						}
+						elsif(WIFSIGNALED($status))
+						{
+							print STDERR "Command killed by signal ", WTERMSIG($status), "\n";
+							$agent->{failed} = 1;
+							
+							next AGENT;
+						}
+						
+						if($output =~ m/^([0-9]+)\r?\n?/s)
+						{
+							$agent->{instances} = $1;
+							$agent->{spawn} = $agent->{instances} * $agent->{spawn_per_instance};
+							
+							print "Instance count: ", $agent->{instances}, ", spawn count: ", $agent->{spawn}, "\n";
+						}
+						else{
+							print STDERR "Unexpected output from command (expected an integer):\n";
+							print STDERR "$output\n";
+							
+							next AGENT;
+						}
+					}
 					
-					print STDERR "Command returned status 75 (temporary failure)\n";
+					if($agent->{jobs_selected} >= $agent->{spawn}
+						&& (!defined($agent->{max_instances}) || $agent->{instances} < $agent->{max_instances}))
+					{
+						# This agent specification has already reached capacity, but it can be scaled up.
+						
+						if($try_launch->())
+						{
+							$agent->{instances} += 1;
+							$agent->{spawn} += $agent->{spawn_per_instance};
+							
+							$agent->{jobs_selected} += 1;
+							
+							next JOB;
+						}
+						else{
+							$agent->{failed} = 1;
+						}
+					}
+				}
+				else{
+					# This is a single-instance agent.
 					
-					($agent->{jobs_selected})++;
-					next JOB;
-				}
-				elsif(WIFEXITED($status))
-				{
-					print STDERR "Command returned status ", WEXITSTATUS($status), "\n";
-					$agent->{failed} = 1;
-				}
-				elsif(WIFSIGNALED($status))
-				{
-					print STDERR "Command killed by signal ", WTERMSIG($status), "\n";
-					$agent->{failed} = 1;
+					if($agent->{jobs_selected} > 0)
+					{
+						# We already launched this agent on this poll, just mark
+						# the agent as being assigned to it.
+						
+						($agent->{jobs_selected})++;
+						next JOB;
+					}
+					
+					if($try_launch->())
+					{
+						$agent->{jobs_selected} += 1;
+						next JOB;
+					}
+					else{
+						$agent->{failed} = 1;
+					}
 				}
 			}
 		}
