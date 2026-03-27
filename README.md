@@ -1,3 +1,7 @@
+# NEW REPOSITORY LOCATION
+
+This repository has been archived and development will continue on [Codeberg](https://codeberg.org/solemnwarning/buildkite-agent-launcher).
+
 # buildkite-agent-launcher
 
 ## Introduction
